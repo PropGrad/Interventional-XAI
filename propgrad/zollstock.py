@@ -112,6 +112,8 @@ class Zollstock:
         ax.set_ylabel("y")
         fig.tight_layout()
 
+        return fig
+
     def nuldist_plot(self, null, original,
                      figsize=(8,5),
                      true_color="#f72585",
@@ -130,6 +132,8 @@ class Zollstock:
         ax.set_ylabel("Number of Occurances")
         fig.tight_layout()
 
+        return fig
+
     
     def shuffle_test(self, predictions, num=1000, plot_null_dist=False, plot_shuffle=False):
         preds = np.array(predictions).copy()
@@ -146,7 +150,11 @@ class Zollstock:
 
         permuted = np.array(permuted)
         
+        null_plot = None
         if plot_null_dist:
-            self.nuldist_plot(permuted, statistic)
+            null_plot = self.nuldist_plot(permuted, statistic)
 
-        return statistic, self.calc_p_val(statistic, permuted)
+        if null_plot:
+            return statistic, self.calc_p_val(statistic, permuted), null_plot
+        else:
+            return statistic, self.calc_p_val(statistic, permuted)
