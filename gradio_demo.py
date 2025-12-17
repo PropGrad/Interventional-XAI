@@ -1,4 +1,5 @@
 import gradio as gr
+import argparse
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
@@ -29,6 +30,54 @@ plt.rc('text.latex', preamble=r'\usepackage{amssymb}\usepackage{wasysym}')
 warnings.simplefilter("ignore")
 
 
+def get_args():
+    parser = argparse.ArgumentParser(description="Interventional Explainer Demo.")
+    # we define the start values for the gradio demo here
+    parser.add_argument(
+        "--example",
+        type=str,
+        default="example_images/cvd/dog_001.jpg",
+        help="Which input example to choose.",
+    )
+    parser.add_argument(
+        "--cfg_img",
+        type=float,
+        default=2.5,
+        help="Image guidance scale for intervention generation.",
+    )
+    parser.add_argument(
+        "--num_steps",
+        type=int,
+        default=10,
+        help="Number of gradual intervention steps.",
+    )
+    parser.add_argument(
+        "--max_cfg_scale",
+        type=float,
+        default=10.0,
+        help="Max text guidance scale for intervention generation.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for intervention generation.",
+    )
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default="Change the fur color to black. Leave other details the same.",
+        help="Intervention instruction.",
+    )
+    parser.add_argument(
+        "--imnet",
+        action="store_true",
+        default=False,
+        help="Use ImageNet model instead of Cats vs Dogs Toy example.",
+    )
+    return parser.parse_args()
+
+
 def load_cm(path, verbose=False):
     load_dict = T.load(path)
 
@@ -45,7 +94,9 @@ def load_cm(path, verbose=False):
 
 
 class Interventional_Explainer:
-    def __init__(self, ):
+    def __init__(self, imnet=False):
+        self.imnet = imnet
+        # loading the diffusion model
         # we overimplement some of our utilities 
         # so we don't have to load the model multiple times
         self.device = 'cuda' if T.cuda.is_available() else 'cpu'
@@ -54,27 +105,62 @@ class Interventional_Explainer:
         self.pipe.set_progress_bar_config(disable=True)
 
         self.interventional_data = []
-
-        self.test_transform = transforms.Compose([
-            # Resize the images to IMAGE_SIZE xIMAGE_SIZE
-            transforms.Resize(size=(128, 128)),
-            # Turn the image into a torch.Tensor
-            # this also converts all pixel values from 0 to 255 to be between 0.0 and 1.0
-            transforms.ToTensor(),
-            # normalize to [-1,1]
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-
-        # loading models for later explanation
-        print("Unbiased:")
-        self.M_unb, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_unbiased.pth", verbose=True)
-        print("\nCats have dark fur bias:")
-        self.M_dcats, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_dark-cats-bias.pth", verbose=True)
-        print("\nDogs have dark fur bias:")
-        self.M_ddogs, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_dark-dogs-bias.pth", verbose=True)
-
-
         self.Z = Zollstock()
+
+        self.load_models()
+
+    def load_models(self):
+        # we load three models in both the imagenet and cats vs dogs case
+        # we also set up the correct transforms and label maps
+        if self.imnet:
+            print("Loading ImageNet Models...")
+            self.M1 = T.hub.load("pytorch/vision", "resnet50", weights="IMAGENET1K_V2")
+            self.M1.eval()
+
+            self.M2 = T.hub.load("pytorch/vision", "convnext_tiny", weights="IMAGENET1K_V1")
+            self.M2.eval()
+
+            self.M3 = T.hub.load("pytorch/vision", "vit_b_16", weights="IMAGENET1K_V1")
+            self.M3.eval()
+            
+            self.test_transform = transforms.Compose([
+                # Resize the images to IMAGE_SIZE xIMAGE_SIZE
+                transforms.Resize(size=(224, 224)),
+                # Turn the image into a torch.Tensor
+                # this also converts all pixel values from 0 to 255 to be between 0.0 and 1.0
+                transforms.ToTensor(),
+                # normalize to [-1,1]
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+            ])
+
+            with open("imnet_classes.txt", "r") as f:
+                labels = [x.replace("_", " ").title() for x in f.read().splitlines()]
+            self.label_map = labels
+
+            self.logit_of_interest = (281, 281, 281)  # tabby cat class
+
+        else:
+            print("Loading Cats vs Dogs Models...") 
+            # loading models for later explanation
+            print("Unbiased:")
+            self.M1, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_unbiased.pth", verbose=True)
+            print("\nCats have dark fur bias:")
+            self.M2, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_dark-cats-bias.pth", verbose=True)
+            print("\nDogs have dark fur bias:")
+            self.M3, _ = load_cm("checkpoints/cats-vs-dogs/convmixer_dark-dogs-bias.pth", verbose=True)
+
+            self.test_transform = transforms.Compose([
+                # Resize the images to IMAGE_SIZE xIMAGE_SIZE
+                transforms.Resize(size=(128, 128)),
+                # Turn the image into a torch.Tensor
+                # this also converts all pixel values from 0 to 255 to be between 0.0 and 1.0
+                transforms.ToTensor(),
+                # normalize to [-1,1]
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            ])
+
+            self.logit_of_interest = (0, 0, 0)  # cat class
+            self.label_map = ["Cat", "Dog"]
 
 
 
@@ -92,27 +178,57 @@ class Interventional_Explainer:
         loader = data.DataLoader(D, batch_size=10, shuffle=False)
         
         # predicting the models
-        logits_unb = perform_inference(self.M_unb, loader)
-        logits_dc = perform_inference(self.M_dcats, loader)
-        logits_dd = perform_inference(self.M_ddogs, loader)
+        logits_M1 = perform_inference(self.M1, loader)
+        logits_M2 = perform_inference(self.M2, loader)
+        logits_M3 = perform_inference(self.M3, loader)
 
-        propgrad_unb, pval_unb, null_dist_unb = self.Z.shuffle_test(logits_unb[:,0], plot_null_dist=True)
-        null_dist_unb.savefig("tmp/null_unb.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
-        plt.close(null_dist_unb)
+        if self.imnet:
+            self.logit_of_interest = (np.argmax(logits_M1[0]), np.argmax(logits_M2[0]), np.argmax(logits_M3[0]))
+
+
+        propgrad_M1, pval_M1, null_dist_M1 = self.Z.shuffle_test(logits_M1[:,self.logit_of_interest[0]], plot_null_dist=True)
+        null_dist_M1.savefig("tmp/null_M1.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
+        plt.close(null_dist_M1)
         
-        propgrad_dc, pval_dc, null_dist_dc = self.Z.shuffle_test(logits_dc[:,0], plot_null_dist=True)
-        null_dist_dc.savefig("tmp/null_dcats.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
-        plt.close(null_dist_dc)
+        propgrad_M2, pval_M2, null_dist_M2 = self.Z.shuffle_test(logits_M2[:,self.logit_of_interest[1]], plot_null_dist=True)
+        null_dist_M2.savefig("tmp/null_M2.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
+        plt.close(null_dist_M2)
 
-        propgrad_dd, pval_dd, null_dist_dd = self.Z.shuffle_test(logits_dd[:,0], plot_null_dist=True)
-        null_dist_dd.savefig("tmp/null_ddogs.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
-        plt.close(null_dist_dd)
+        propgrad_M3, pval_M3, null_dist_M3 = self.Z.shuffle_test(logits_M3[:,self.logit_of_interest[2]], plot_null_dist=True)
+        null_dist_M3.savefig("tmp/null_M3.png", transparent=False, bbox_inches='tight', pad_inches=0.1)
+        plt.close(null_dist_M3)
 
-        print(f"Unbiased PropGrad: {propgrad_unb:.4f}, p-value: {pval_unb:.4f}")
-        print(f"Dark Cats Bias PropGrad: {propgrad_dc:.4f}, p-value: {pval_dc:.4f}")
-        print(f"Dark Dogs Bias PropGrad: {propgrad_dd:.4f}, p-value: {pval_dd:.4f}")
+        print("M1 - Prediction on Original Image:", 
+              np.argmax(logits_M1[0]), 
+              logits_M1[0, np.argmax(logits_M1[0])],
+              f"({self.label_map[np.argmax(logits_M1[0])]})")
+        print("M1 - Prediction on Full Intervention:", 
+              np.argmax(logits_M1[-1]), 
+              logits_M1[-1, np.argmax(logits_M1[-1])],
+              f"({self.label_map[np.argmax(logits_M1[-1])]})")
+        print(f"M1 - PropGrad: {propgrad_M1:.4f}, p-value: {pval_M1:.4f}\n")
         
-        fig = plt.figure(figsize=(14,4.5))
+        print("M2 - Prediction on Original Image:", 
+              np.argmax(logits_M2[0]), 
+              logits_M2[0, np.argmax(logits_M2[0])],
+              f"({self.label_map[np.argmax(logits_M2[0])]})")
+        print("M2 - Prediction on Full Intervention:", 
+              np.argmax(logits_M2[-1]), 
+              logits_M2[-1, np.argmax(logits_M2[-1])],
+              f"({self.label_map[np.argmax(logits_M2[-1])]})")
+        print(f"M2 - PropGrad: {propgrad_M2:.4f}, p-value: {pval_M2:.4f}\n")
+        
+        print("M3 - Prediction on Original Image:", 
+              np.argmax(logits_M3[0]), 
+              logits_M3[0, np.argmax(logits_M3[0])],
+              f"({self.label_map[np.argmax(logits_M3[0])]})")
+        print("M3 - Prediction on Full Intervention:", 
+              np.argmax(logits_M3[-1]), 
+              logits_M3[-1, np.argmax(logits_M3[-1])],
+              f"({self.label_map[np.argmax(logits_M3[-1])]})")        
+        print(f"M3 -  PropGrad: {propgrad_M3:.4f}, p-value: {pval_M3:.4f}\n")
+        
+        fig = plt.figure(figsize=(14,5))
         ax = fig.add_subplot(111)
 
         # order should be cats, dogs
@@ -120,27 +236,39 @@ class Interventional_Explainer:
         lw = 3
         ms = 12
 
-        c_unb = "#f72585" 
-        c_dcats = "#3a0ca3" 
-        c_ddogs = "#4895ef" 
+        c_M1 = "#f72585" 
+        c_M2 = "#3a0ca3" 
+        c_M3 = "#4895ef" 
 
         num = len(self.interventional_data) +1
         vals = np.arange(num)
 
-        ax.plot(vals, logits_unb[:,0], label="Unbiased\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_unb:.3f}$\n" + f"$p$-val = {pval_unb:.3f}", color=c_unb, linestyle="-", linewidth=lw, )
-        ax.plot(vals, logits_dc[:,0], label="Dark Cats Bias\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_dc:.3f}$\n" + f"$p$-val = {pval_dc:.3f}", color=c_dcats, linestyle=":", linewidth=lw, marker="*", markevery=me, markersize=ms)
-        ax.plot(vals, logits_dd[:,0], label="Dark Dogs Bias\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_dd:.3f}$\n" + f"$p$-val = {pval_dd:.3f}", color=c_ddogs, linestyle=":", linewidth=lw, marker="v", markevery=me, markersize=ms)
-        ax.axhline(0.5, color="r", linestyle="--")
+        if self.imnet:
+            model_labels = [f"ResNet-50 ({self.label_map[self.logit_of_interest[0]]})", 
+                            f"ConvNext-T ({self.label_map[self.logit_of_interest[1]]})",
+                            f"ViT-B/16 ({self.label_map[self.logit_of_interest[2]]})"]
+        else:
+            model_labels = ["Unbiased", "Dark Cats Bias", "Dark Dogs Bias"]
+        ax.plot(vals, logits_M1[:,self.logit_of_interest[0]], label=f"{model_labels[0]}\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_M1:.3f}$\n" + f"$p$-val = {pval_M1:.3f}", color=c_M1, linestyle="-", linewidth=lw, )
+        ax.plot(vals, logits_M2[:,self.logit_of_interest[1]], label=f"{model_labels[1]}\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_M2:.3f}$\n" + f"$p$-val = {pval_M2:.3f}", color=c_M2, linestyle=":", linewidth=lw, marker="*", markevery=me, markersize=ms)
+        ax.plot(vals, logits_M3[:,self.logit_of_interest[2]], label=f"{model_labels[2]}\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_M3:.3f}$\n" + f"$p$-val = {pval_M3:.3f}", color=c_M3, linestyle=":", linewidth=lw, marker="v", markevery=me, markersize=ms)
+        
+        if not self.imnet:
+            ax.axhline(0.5, color="r", linestyle="--")
+            ax.set_ylim((-0.1,1.1)),20
+            ax.set_yticks([0,1], ["Dog", "Cat"])
+            ax.set_ylabel("Prediction")
+        else:
+            max_val = max(np.max(logits_M1[:,self.logit_of_interest[0]]), np.max(logits_M2[:,self.logit_of_interest[1]]), np.max(logits_M3[:,self.logit_of_interest[2]]))
+            ax.set_ylim((-0.1, max_val*1.1))
+            ax.set_ylabel("Prediction Logit Value") 
 
-        ax.set_ylim((-0.1,1.1))
 
         ax.set_xticks([num*0.05,(num-1)*0.95], ["Original", "Interventional"])
-        ax.set_yticks([0,1], ["Dog", "Cat"])
-
-
-        ax.set_ylabel("Prediction")
         ax.set_xlabel("Data")
-        ax.legend(loc='center right', bbox_to_anchor=(1.45, 0.5), title="ConvMixer Models",
+
+        legend_title = "ConvMixer Models" if not self.imnet else "Models (Pred. Class)"
+        ax.legend(loc='center right', bbox_to_anchor=(1.55, 0.5), title=legend_title,
                 ncol=1, fancybox=True, shadow=True) 
 
         fig.tight_layout(pad=0.2)
@@ -150,7 +278,7 @@ class Interventional_Explainer:
         fig.savefig("tmp/explanation.png", transparent=False, bbox_inches='tight', pad_inches=0.2)
         plt.close('all')
 
-        return gr.update(value="tmp/explanation.png", visible=True), gr.update(value="tmp/null_unb.png", visible=True), gr.update(value="tmp/null_dcats.png", visible=True), gr.update(value="tmp/null_ddogs.png", visible=True)
+        return gr.update(value="tmp/explanation.png", visible=True), gr.update(value="tmp/null_M1.png", visible=True), gr.update(value="tmp/null_M2.png", visible=True), gr.update(value="tmp/null_M3.png", visible=True)
     
 
 
@@ -195,22 +323,29 @@ class Interventional_Explainer:
 
 
 if __name__ == "__main__":
-    explainer = Interventional_Explainer()
+    args = get_args()
+    explainer = Interventional_Explainer(imnet=args.imnet)
+
+    # just for displaying correct labels for the toy example and the imagenet case
+    if args.imnet:
+        null_dist_labels = ["ResNet-50 Null Distribution", "ConvNext-T Null Distribution", "ViT-B/16 Null Distribution"]
+    else:
+        null_dist_labels = ["Unbiased Null Distribution", "Dark Cats Bias Null Distribution", "Dark Dogs Bias Null Distribution"]
 
     demo = gr.Blocks()
     with demo:
         with gr.Row():   
             with gr.Column(scale=2, min_width=300):
                 with gr.Row():
-                    input_image = gr.Image("example_images/dog_001.jpg", height=300, width=400, label="Input Image", interactive=True)
+                    input_image = gr.Image(args.example, height=300, width=400, label="Input Image", interactive=True)
                 with gr.Row():
-                    instruction = gr.Textbox(value="Change the fur color to black. Leave other details the same.", max_lines=3, label="Intervention Instruction", interactive=True)
+                    instruction = gr.Textbox(value=args.instruction, max_lines=3, label="Intervention Instruction", interactive=True)
                 with gr.Row():
-                    cfg_img = gr.Number(value=2.5, label="Image Guidance Scale", interactive=True)
-                    seed = gr.Number(value=0, label="Random Seed", interactive=True)
+                    cfg_img = gr.Number(value=args.cfg_img, label="Image Guidance Scale", interactive=True)
+                    seed = gr.Number(value=args.seed, label="Random Seed", interactive=True)
                 with gr.Row():
-                    max_cfg_scale = gr.Slider(value=10.0, minimum=2.0, maximum=20, label="Max Text Guidance Scale", interactive=True)
-                    num_steps = gr.Number(value=100, label="Number of Gradual Intervention Steps", interactive=True)
+                    max_cfg_scale = gr.Slider(value=args.max_cfg_scale, minimum=2.0, maximum=20, label="Max Text Guidance Scale", interactive=True)
+                    num_steps = gr.Number(value=args.num_steps, label="Number of Gradual Intervention Steps", interactive=True)
                 with gr.Row():
                     run = gr.Button("1. Generate Interventional Data")
 
@@ -225,9 +360,9 @@ if __name__ == "__main__":
                 with gr.Row():
                     explanation_output = gr.Image(None, visible=True, height=400, label="Model Behavior", interactive=False)
                 with gr.Row():
-                    null_unb = gr.Image(None, visible=True, height=250, label="Unbiased Null Distribution", interactive=False)
-                    null_dcats = gr.Image(None, visible=True, height=250, label="Dark Cats Bias Null Distribution", interactive=False)
-                    null_ddogs = gr.Image(None, visible=True, height=250, label="Dark Dogs Bias Null Distribution", interactive=False)
+                    null_M1 = gr.Image(None, visible=True, height=250, label=null_dist_labels[0], interactive=False)
+                    null_M2 = gr.Image(None, visible=True, height=250, label=null_dist_labels[1], interactive=False)
+                    null_M3 = gr.Image(None, visible=True, height=250, label=null_dist_labels[2], interactive=False)
 
                     
 
@@ -236,7 +371,7 @@ if __name__ == "__main__":
         run.click(fn=explainer.generate_interventions, inputs=inputs_run, outputs=outputs_run)
 
         inputs_xai = [input_image]
-        outputs_xai = [explanation_output, null_unb, null_dcats, null_ddogs]
+        outputs_xai = [explanation_output, null_M1, null_M2, null_M3]
         xai.click(fn=explainer.explain, inputs=inputs_xai, outputs=outputs_xai)
 
     demo.launch()

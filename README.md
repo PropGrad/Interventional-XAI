@@ -43,6 +43,14 @@ This launches a web application where you can:
 3. Explain predictions from three toy ConvMixer models (unbiased, dark-cats-bias, dark-dogs-bias)
 4. Visualize the expected property gradient and statistical significance
 
+##### Update:
+We now also provide a second demo using some pretrained ImageNet models.
+To start this demo simply run:
+
+```bash
+python gradio_demo.py --imnet
+```
+
 ## Utility Functions (`propgrad/`)
 
 The `propgrad` package provides several utility modules:
