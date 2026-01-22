@@ -244,9 +244,15 @@ class Interventional_Explainer:
         vals = np.arange(num)
 
         if self.imnet:
-            model_labels = [f"ResNet-50 ({self.label_map[self.logit_of_interest[0]]})", 
-                            f"ConvNext-T ({self.label_map[self.logit_of_interest[1]]})",
-                            f"ViT-B/16 ({self.label_map[self.logit_of_interest[2]]})"]
+            lengths = [len(self.label_map[x]) for x in self.logit_of_interest]
+            if max(lengths) > 7:
+                inbetween = "\n"
+            else:
+                inbetween = " "
+                
+            model_labels = [f"ResNet-50{inbetween}({self.label_map[self.logit_of_interest[0]]})", 
+                            f"ConvNext-T{inbetween}({self.label_map[self.logit_of_interest[1]]})",
+                            f"ViT-B/16{inbetween}({self.label_map[self.logit_of_interest[2]]})"]
         else:
             model_labels = ["Unbiased", "Dark Cats Bias", "Dark Dogs Bias"]
         ax.plot(vals, logits_M1[:,self.logit_of_interest[0]], label=f"{model_labels[0]}\n" + r"$\mathbb{E}[|\nabla_\mathsf{X}\mathbb{F}|] = " + f"{propgrad_M1:.3f}$\n" + f"$p$-val = {pval_M1:.3f}", color=c_M1, linestyle="-", linewidth=lw, )
