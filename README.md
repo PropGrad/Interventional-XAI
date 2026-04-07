@@ -95,13 +95,15 @@ exp_prop_grad, p_value = z.shuffle_test(model_predictions)
 ## If you enjoy or build on our work, consider citing our paper:
 
 ```
-@inproceedings{penzel2025locally,
-    author = {Niklas Penzel and Joachim Denzler},
-    title = {Locally Explaining Prediction Behavior via Gradual Interventions and Measuring Property Gradients},
-    year = {2025},
-    doi = {10.48550/arXiv.2503.05424},
-    arxiv = {https://arxiv.org/abs/2503.05424},
-    note = {accepted at WACV 2026},
+@inproceedings{penzel2026locally,
+  author        = {Niklas Penzel and Joachim Denzler},
+  title         = {Locally Explaining Prediction Behavior via Gradual Interventions and Measuring Property Gradients},
+  year          = {2026},
+  booktitle     = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+  month         = {March},
+  year          = {2026},
+  pages         = {7398-7408},
+  url           = {https://propgrad.github.io},
 }
 ```
 
